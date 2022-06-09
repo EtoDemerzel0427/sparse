@@ -13,7 +13,7 @@ import torchvision.datasets as datasets
 import resnet
 from memory import SGDMemory
 from compression import SGDCompressor
-from optim import DGCSGD
+from optim import SparseSGD
 
 model_names = sorted(name for name in resnet.__dict__
                      if name.islower() and not name.startswith("__")
@@ -59,6 +59,8 @@ parser.add_argument('--save-every', dest='save_every',
                     type=int, default=10)
 parser.add_argument('--compress', action='store_true',
                     help="do sparsification on gradients")
+parser.add_argument('--warmup', default=0, type=int, metavar='N',
+                    help='number of epochs that do not do sparsification')
 best_prec1 = 0
 
 
@@ -119,7 +121,7 @@ def main():
 
     if args.compress:
         memory = SGDMemory()
-        compressor = SGDCompressor(compress_ratio=0.01, memory=memory, warmup_epochs=10)
+        compressor = SGDCompressor(compress_ratio=0.01, memory=memory)
         compressor.memory.initialize(model.named_parameters())
         cpr_parameters = {}
         for name, param in model.named_parameters():
@@ -127,12 +129,12 @@ def main():
                 cpr_parameters[name] = param
         compressor.initialize(cpr_parameters.items())
 
-        optimizer = DGCSGD(model.parameters(),
-                           model.named_parameters(),
-                           args.lr,
-                           compressor=compressor,
-                           momentum=args.momentum,
-                           weight_decay=args.weight_decay)
+        optimizer = SparseSGD(model.parameters(),
+                              model.named_parameters(),
+                              args.lr,
+                              compressor=compressor,
+                              momentum=args.momentum,
+                              weight_decay=args.weight_decay)
     else:
         optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                     momentum=args.momentum,
@@ -153,6 +155,8 @@ def main():
         return
 
     for epoch in range(args.start_epoch, args.epochs):
+        if epoch > args.warmup:
+            optimizer.warmup = False
 
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))

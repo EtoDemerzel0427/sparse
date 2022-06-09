@@ -3,7 +3,7 @@
 import torch
 from torch.optim.optimizer import Optimizer #, required
 
-__all__ = ['DGCSGD']
+__all__ = ['SparseSGD']
 
 class _RequiredParameter(object):
     """Singleton class representing a required parameter for an Optimizer."""
@@ -13,7 +13,7 @@ class _RequiredParameter(object):
 required = _RequiredParameter()
 
 
-class DGCSGD(Optimizer):
+class SparseSGD(Optimizer):
     def __init__(self, params, named_parameters, lr=required, compressor=None, momentum=0, dampening=0,
                  weight_decay=0, nesterov=False):
         if lr is not required and lr < 0.0:
@@ -37,10 +37,11 @@ class DGCSGD(Optimizer):
                         weight_decay=weight_decay, nesterov=nesterov)
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        super(DGCSGD, self).__init__(params, defaults)
+        self.warmup = True
+        super(SparseSGD, self).__init__(params, defaults)
 
     def __setstate__(self, state):
-        super(DGCSGD, self).__setstate__(state)
+        super(SparseSGD, self).__setstate__(state)
         for group in self.param_groups:
             group.setdefault('nesterov', False)
 
@@ -63,7 +64,8 @@ class DGCSGD(Optimizer):
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
         """
-        self.synchronize()
+        if not self.warmup:
+            self.synchronize()
 
         loss = None
         if closure is not None:
