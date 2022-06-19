@@ -54,8 +54,10 @@ class SparseSGD(Optimizer):
                 tensor_compressed, ctx = self.compressor.compress(p.grad, name)
 
                 # fake synchronization, decompress in-place
-                p.grad.set_(self.compressor.decompress(tensor_compressed, ctx))
-
+                #p.grad.set_(self.compressor.decompress(tensor_compressed, ctx))
+                #print(f"Nonzeros before:{torch.count_nonzero(p.grad)}")
+                p.grad = self.compressor.decompress(tensor_compressed, ctx)
+                #print(f"Nonzeros after:{torch.count_nonzero(p.grad)}")
 
     @torch.no_grad()
     def step(self, closure=None):

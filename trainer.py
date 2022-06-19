@@ -120,6 +120,8 @@ def main():
         criterion.half()
 
     if args.compress:
+        print("Using sparse optimizer")
+        print(f"warmup epochs:{args.warmup}")
         memory = SGDMemory()
         compressor = SGDCompressor(compress_ratio=0.01, memory=memory)
         compressor.memory.initialize(model.named_parameters())
@@ -157,7 +159,7 @@ def main():
     for epoch in range(args.start_epoch, args.epochs):
         if epoch > args.warmup:
             optimizer.warmup = False
-
+            print("finish warmup")
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         train(train_loader, model, criterion, optimizer, epoch)

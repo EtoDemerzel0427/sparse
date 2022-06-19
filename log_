@@ -1,0 +1,7 @@
+['resnet110', 'resnet1202', 'resnet20', 'resnet32', 'resnet44', 'resnet56']
+usage: trainer.py [-h] [--arch ARCH] [-j N] [--epochs N] [--start-epoch N]
+                  [-b N] [--lr LR] [--momentum M] [--weight-decay W]
+                  [--print-freq N] [--resume PATH] [-e] [--pretrained]
+                  [--half] [--save-dir SAVE_DIR] [--save-every SAVE_EVERY]
+                  [--compress] [--warmup N]
+trainer.py: error: argument --arch/-a: invalid choice: '' (choose from 'resnet110', 'resnet1202', 'resnet20', 'resnet32', 'resnet44', 'resnet56')
