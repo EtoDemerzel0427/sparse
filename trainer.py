@@ -15,6 +15,11 @@ from memory import SGDMemory
 from compression import SGDCompressor
 from optim import SparseSGD
 
+import numpy as np
+import random
+import torch.distributed as dist
+import builtins
+
 model_names = sorted(name for name in resnet.__dict__
                      if name.islower() and not name.startswith("__")
                      and name.startswith("resnet")
@@ -61,19 +66,55 @@ parser.add_argument('--compress', action='store_true',
                     help="do sparsification on gradients")
 parser.add_argument('--warmup', default=0, type=int, metavar='N',
                     help='number of epochs that do not do sparsification')
+
+# DDP settings
+parser.add_argument('--world-size', default=-1, type=int,
+                    help='number of nodes for distributed training')
+parser.add_argument('--rank', default=-1, type=int,
+                    help='node rank for distributed training')
+parser.add_argument('--dist-url', default='env://', type=str,
+                    help='url used to set up distributed training')
+parser.add_argument('--dist-backend', default='nccl', type=str,
+                    help='distributed backend')
+parser.add_argument('--local_rank', default=-1, type=int,
+                    help='local rank for distributed training')
+
 best_prec1 = 0
 
 
 def main():
     global args, best_prec1
     args = parser.parse_args()
-
-
     # Check the save_dir exists or not
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+    if "WORLD_SIZE" in os.environ:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+    args.distributed = args.world_size > 1
+    ngpus_per_node = torch.cuda.device_count()
+
+    if args.distributed:
+        if args.local_rank != -1: # for torch.distributed.launch
+            args.rank = args.local_rank
+            args.gpu = args.local_rank
+        elif 'SLURM_PROCID' in os.environ: # for slurm scheduler
+            args.rank = int(os.environ['SLURM_PROCID'])
+            args.gpu = args.rank % torch.cuda.device_count()
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+
+    # suppress printing if not on master gpu
+    if args.rank!=0:
+        def print_pass(*args):
+            pass
+        builtins.print = print_pass
+
+    print(f"Let's use {torch.cuda.device_count()} GPUS.")
+    if not args.distributed:
+        model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+    else:
+        model = torch.nn.parallel.DistributedDataParallel(resnet.__dict__[args.arch]())
     model.cuda()
 
     # optionally resume from a checkpoint
@@ -94,15 +135,27 @@ def main():
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
-    train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
+    train_dataset = datasets.CIFAR10(
+        root='./data', train=True,
+        transform=transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(32, 4),
             transforms.ToTensor(),
             normalize,
-        ]), download=True),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True)
+        ]), download=True)
+
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True,
+        sampler=train_sampler
+    )
 
     val_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
@@ -149,8 +202,7 @@ def main():
         # for resnet1202 original paper uses lr=0.01 for first 400 minibatches for warm-up
         # then switch back. In this setup it will correspond for first epoch.
         for param_group in optimizer.param_groups:
-            param_group['lr'] = args.lr*0.1
-
+            param_group['lr'] = args.lr * 0.1
 
     if args.evaluate:
         validate(val_loader, model, criterion)
@@ -160,29 +212,36 @@ def main():
         if epoch > args.warmup:
             optimizer.warmup = False
             print("finish warmup")
+
+        np.random.seed(epoch)
+        random.seed(epoch)
+        # fix sampling seed such that each gpu gets different part of dataset
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         train(train_loader, model, criterion, optimizer, epoch)
         lr_scheduler.step()
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        if args.rank == 0:
+            prec1 = validate(val_loader, model, criterion)
 
-        # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
-        best_prec1 = max(prec1, best_prec1)
+            # remember best prec@1 and save checkpoint
+            is_best = prec1 > best_prec1
+            best_prec1 = max(prec1, best_prec1)
 
-        if epoch > 0 and epoch % args.save_every == 0:
+            if epoch > 0 and epoch % args.save_every == 0:
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'best_prec1': best_prec1,
+                }, is_best, filename=os.path.join(args.save_dir, 'checkpoint.th'))
+
             save_checkpoint({
-                'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(args.save_dir, 'checkpoint.th'))
-
-        save_checkpoint({
-            'state_dict': model.state_dict(),
-            'best_prec1': best_prec1,
-        }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
+            }, is_best, filename=os.path.join(args.save_dir, 'model.th'))
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
@@ -289,14 +348,17 @@ def validate(val_loader, model, criterion):
 
     return top1.avg
 
+
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     """
     Save the training model
     """
     torch.save(state, filename)
 
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
+
     def __init__(self):
         self.reset()
 
