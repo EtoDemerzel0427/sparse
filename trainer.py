@@ -105,16 +105,17 @@ def main():
                                 world_size=args.world_size, rank=args.rank)
 
     # suppress printing if not on master gpu
-    if args.rank!=0:
+    if args.rank != 0:
         def print_pass(*args):
             pass
         builtins.print = print_pass
 
     print(f"Let's use {torch.cuda.device_count()} GPUS.")
+    model = resnet.__dict__[args.arch]().cuda()
     if not args.distributed:
-        model = torch.nn.DataParallel(resnet.__dict__[args.arch]())
+        model = torch.nn.DataParallel(model)
     else:
-        model = torch.nn.parallel.DistributedDataParallel(resnet.__dict__[args.arch]())
+        model = torch.nn.parallel.DistributedDataParallel(model)
     model.cuda()
 
     # optionally resume from a checkpoint
