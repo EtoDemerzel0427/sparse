@@ -50,7 +50,7 @@ def accuracy(output, target, topk=(1,)):
 def set_random_seeds(random_seed=0):
     torch.manual_seed(random_seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
     np.random.seed(random_seed)
     random.seed(random_seed)
 
@@ -165,9 +165,9 @@ best_prec1 = 0
 
 def main():
     global best_prec1
-    num_epochs_default = 200 #10000
-    batch_size_default = 128  # 1024
-    learning_rate_default = 0.1
+    num_epochs_default = 600 #10000
+    batch_size_default = 512  # 1024
+    learning_rate_default = 0.02
     random_seed_default = 0
     model_dir_default = "saved_models"
     model_filename_default = "resnet_distributed.pth"
@@ -201,7 +201,7 @@ def main():
     num_epochs = argv.num_epochs
     batch_size = argv.batch_size
     learning_rate = argv.learning_rate
-    random_seed = argv.random_seed
+    random_seed = argv.random_seed + local_rank
     model_dir = argv.model_dir
     model_filename = argv.model_filename
     resume = argv.resume
@@ -216,7 +216,7 @@ def main():
     model_filepath = os.path.join(model_dir, model_filename)
 
     # We need to use seeds to make sure that the models initialized in different processes are the same
-    set_random_seeds(random_seed=random_seed)
+    set_random_seeds(random_seed=0)
 
     # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
     torch.distributed.init_process_group(backend="nccl")
@@ -225,6 +225,7 @@ def main():
     # Encapsulate the model on the GPU assigned to the current process
     # model = torchvision.models.resnet18(pretrained=False)
     model = resnet.__dict__[argv.arch]()
+    set_random_seeds(random_seed=random_seed)
 
     device = torch.device("cuda:{}".format(local_rank))
     model = model.to(device)
@@ -269,13 +270,14 @@ def main():
 
     # Loop over the dataset multiple times
     for epoch in range(num_epochs):
+        train_sampler.set_epoch(epoch)
 
         # print("Local Rank: {}, Epoch: {}, Training ...".format(local_rank, epoch))
 
         # Save and evaluate model routinely
-        # if epoch % 10 == 0:
-        if local_rank == 0:
-            prec1 = evaluate(model=ddp_model, device=device, test_loader=test_loader, criterion=criterion)
+        if epoch % 10 == 0:
+            if local_rank == 0:
+                prec1 = evaluate(model=ddp_model, device=device, test_loader=test_loader, criterion=criterion)
 
                 # # remember best prec@1 and save checkpoint
                 # is_best = prec1 > best_prec1
