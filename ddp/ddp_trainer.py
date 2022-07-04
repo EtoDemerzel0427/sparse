@@ -54,7 +54,7 @@ def set_random_seeds(random_seed=0):
     np.random.seed(random_seed)
     random.seed(random_seed)
 
-def train(train_loader, model, device, criterion, optimizer, epoch):
+def train(train_loader, model, device, criterion, optimizer, epoch, local_rank):
     """
         Run one train epoch
     """
@@ -97,12 +97,12 @@ def train(train_loader, model, device, criterion, optimizer, epoch):
         end = time.time()
 
         if i % 50 == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
+            print('Rank: [{0}] Epoch: [{1}][{2}/{3}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
-                epoch, i, len(train_loader), batch_time=batch_time,
+                local_rank, epoch, i, len(train_loader), batch_time=batch_time,
                 data_time=data_time, loss=losses, top1=top1))
 
 
@@ -270,23 +270,23 @@ def main():
     # Loop over the dataset multiple times
     for epoch in range(num_epochs):
 
-        print("Local Rank: {}, Epoch: {}, Training ...".format(local_rank, epoch))
+        # print("Local Rank: {}, Epoch: {}, Training ...".format(local_rank, epoch))
 
         # Save and evaluate model routinely
-        if epoch % 10 == 0:
-            if local_rank == 0:
-                prec1 = evaluate(model=ddp_model, device=device, test_loader=test_loader, criterion=criterion)
+        # if epoch % 10 == 0:
+        if local_rank == 0:
+            prec1 = evaluate(model=ddp_model, device=device, test_loader=test_loader, criterion=criterion)
 
                 # # remember best prec@1 and save checkpoint
                 # is_best = prec1 > best_prec1
                 # best_prec1 = max(prec1, best_prec1)
-                torch.save(ddp_model.state_dict(), model_filepath)
+            torch.save(ddp_model.state_dict(), model_filepath)
                 # print("-" * 75)
                 # print("Epoch: {}, Accuracy: {}".format(epoch, accuracy))
                 # print("-" * 75)
 
         ddp_model.train()
-        train(train_loader, model, device, criterion, optimizer, epoch)
+        train(train_loader, model, device, criterion, optimizer, epoch, local_rank)
         lr_scheduler.step()
 
         # for data in train_loader:
