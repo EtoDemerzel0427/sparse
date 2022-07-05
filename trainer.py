@@ -68,6 +68,8 @@ parser.add_argument('--compress', action='store_true',
                     help="do sparsification on gradients")
 parser.add_argument('--warmup', default=0, type=int, metavar='N',
                     help='number of epochs that do not do sparsification')
+parser.add_argument('--start-iter', default=0, type=int, metavar='N',
+                    help='number of iterations that do not do sparsification')
 
 # DDP settings
 parser.add_argument('--world-size', default=-1, type=int,
@@ -201,7 +203,7 @@ def main():
         optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                     momentum=args.momentum,
                                     weight_decay=args.weight_decay)
-        memory_state = MemoryState(None, start_iter=1_000)
+        memory_state = MemoryState(None, start_iter=args.start_iter)
         memory_state.initialize(model.parameters())
         model.register_comm_hook(memory_state, hook=compress_hook)
 
@@ -221,13 +223,13 @@ def main():
     for epoch in range(args.start_epoch, args.epochs):
         if epoch > args.warmup:
             optimizer.warmup = False
-            print("finish warmup")
+            # print("finish warmup")
 
         np.random.seed(epoch)
         random.seed(epoch)
         # fix sampling seed such that each gpu gets different part of dataset
         if args.distributed:
-            train_sampler.set_epoch(epoch)
+            train_loader.sampler.set_epoch(epoch)
         # train for one epoch
         print('current lr {:.5e}'.format(optimizer.param_groups[0]['lr']))
         train(train_loader, model, criterion, optimizer, epoch, device)
