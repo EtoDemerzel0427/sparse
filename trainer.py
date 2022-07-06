@@ -19,7 +19,6 @@ import numpy as np
 import random
 import torch.distributed as dist
 import builtins
-
 from comm import *
 
 model_names = sorted(name for name in resnet.__dict__
@@ -204,8 +203,8 @@ def main():
                                     momentum=args.momentum,
                                     weight_decay=args.weight_decay)
         memory_state = MemoryState(None, start_iter=args.start_iter)
-        memory_state.initialize(model.parameters())
         model.register_comm_hook(memory_state, hook=compress_hook)
+
 
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                         milestones=[100, 150], last_epoch=args.start_epoch - 1)

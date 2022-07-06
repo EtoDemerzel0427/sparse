@@ -15,18 +15,12 @@ class MemoryState(object):
         self.momentum = momentum
         self.nesterov = nesterov
 
-        self.momentums = []
-        self.velocities = []
-        self.numels = []
+        # dict keys are bucket id
+        self.momentum_dict = {}
+        self.volocities_dict = {}
 
         self.iter = 0
         self.start_iter = start_iter
-
-    def initialize(self, parameters):
-        for param in parameters:
-            self.momentums.append(torch.zeros_like(param.data))
-            self.velocities.append(torch.zeros_like(param.data))
-            self.numels.append(param.numel())
 
     def maybe_increase_iter(self, bucket):
         # Since bucket 0 is the last bucket to allreduce in an iteration.
@@ -34,30 +28,8 @@ class MemoryState(object):
         if bucket.is_the_last_bucket_to_allreduce():
             self.iter += 1
 
-    def compensate(self, grad, index, accumulate=True):
-        """Update the velocities with the momentums."""
-        if self.gradient_clipping is not None:
-            grad = self.gradient_clipping(grad)
-        mmt = self.momentums[index]
-        if accumulate:
-            vec = self.velocities[index]
-            if self.nesterov:
-                mmt.add_(grad).mul_(self.momentum)
-                vec.add_(mmt).add_(grad)
-            else:
-                mmt.mul_(self.momentum).add_(grad)
-                vec.add_(mmt)
-            return vec
-        else:
-            if self.nesterov:
-                mmt.add_(grad).mul_(self.momentum)
-                return mmt.add(grad)
-            else:
-                mmt.mul_(self.momentum).add_(grad)
-                return mmt.clone()
 
-
-def compress_hook(state, bucket):
+def compress_hook(state: MemoryState, bucket):
     process_group = state.process_group
     group_to_use = process_group if process_group is not None else dist.group.WORLD
     world_size = group_to_use.size()
@@ -70,65 +42,137 @@ def compress_hook(state, bucket):
         state.maybe_increase_iter(bucket)
         return default._allreduce_fut(group_to_use, input_tensor)
 
+    device = input_tensor.device
+    dtype = input_tensor.dtype
+
     # Unflatten the input tensor into per-parameter tensors, for layer-wise compression.
     tensors = bucket.get_per_parameter_tensors()
 
-    all_indices, all_values = torch.tensor([]), torch.tensor([])
-    start_idx, end_idx = 0, 0
-    for i, tensor in enumerate(tensors):
-        start_idx = end_idx
-        end_idx = start_idx + state.numels[i]
-        # update memory state with the new grad tensor
-        state.compensate(tensor, i)
+    # divide tensors into two groups,
+    # one will be compressed before doing all_gather, another will directly do allreduce as normal without compression
+    tensors_to_compress, uncompressed_tensors = [], []
+    compress_size, uncompress_size = 0, 0
+    for tensor in tensors:
+        # don't compress tensors with too few parameters
+        if tensor.numel() * state.compress_ratio < 1.:
+            uncompressed_tensors.append(tensor)
+            uncompress_size += tensor.numel()
+        else:
+            tensors_to_compress.append(tensor)
+            compress_size += tensor.numel()
 
-        # find the compression threshold
-        tensor = tensor.view(-1)
-        importance = tensor.abs()
-        threshold = torch.min(torch.topk(importance, int(importance.numel() * state.compress_ratio), 0, largest=True, sorted=False)[0])
+    bucket_id = bucket.get_index()
+    if bucket_id not in state.momentum_dict:
+        state.momentum_dict[bucket_id] = torch.zeros(compress_size, device=device, dtype=dtype)
+        state.volocities_dict[bucket_id] = torch.zeros(uncompress_size, device=device, dtype=dtype)
 
-        # get indices to keep for this process
+    # handle uncompressed_tensors
+    # Allocate contiguous memory for these tensors to allreduce efficiently.
+    uncompressed_tensors_memory = (
+        torch.cat([tensor.view(-1) for tensor in uncompressed_tensors])
+        if uncompressed_tensors
+        else torch.tensor([], device=device, dtype=dtype)
+    )
+
+    # handle the tensors that should be compressed
+    all_indices, all_values = [], []
+    start_idx = 0
+    for tensor in tensors_to_compress:
+        # accumulate local gradients with current grad tensor adding in
+        mmt = state.momentum_dict[bucket_id][start_idx: start_idx + tensor.numel()]
+        vec = state.volocities_dict[bucket_id][start_idx: start_idx + tensor.numel()]
+        if state.nesterov:
+            mmt.add_(tensor.view(-1)).mul_(state.momentum)
+            vec.add_(mmt).add_(tensor.view(-1))
+        else:
+            mmt.mul_(state.momentum).add_(tensor.view(-1))
+            vec.add_(mmt)
+
+        # select top k
+        importance = tensor.abs().view(-1)
+        threshold = torch.min(
+            torch.topk(importance, int(importance.numel() * state.compress_ratio), 0, largest=True, sorted=False)[0])
         mask = torch.ge(importance, threshold)
         indices = mask.nonzero().view(-1)
-        values = tensor[indices]
+        values = mmt.clone()[indices]
 
-        # clear corresponding gradients
-        if state.momentum_masking:
-            state.momentums[i].view(-1).index_fill_(0, indices, 0)
-        state.velocities[i].view(-1).index_fill_(0, indices, 0)
-
-        # map to input_tensor indices
+        # map indices to global
         indices.add_(start_idx)
 
-        all_indices = torch.cat((all_indices, indices))
-        all_values = torch.cat((all_values, values))
+        # clear those entries in memory states
+        state.momentum_dict[bucket_id].index_fill_(0, indices, 0)
+        state.volocities_dict[bucket_id].index_fill_(0, indices, 0)
 
-    ctx = torch.stack((all_indices, all_values), 0)
+        all_indices.append(indices)
+        all_values.append(values)
 
-    # communication
-    out_list = [torch.zeros_like(ctx, device=ctx.device,
-            dtype=ctx.dtype) for _ in range(world_size)]
+        start_idx += tensor.numel()
 
-    fut = dist.all_gather(
-        out_list, ctx, group=group_to_use, async_op=True).get_future()
+    all_indices = torch.cat(all_indices)
+    all_values = torch.cat(all_values)
+    output_indices = [torch.zeros_like(all_indices, device=device, dtype=dtype) for _ in world_size]
+    output_values = [torch.zeros_like(all_values, device=device, dtype=dtype) for _ in world_size]
+
+    # This allreduce is only applied to uncompressed tensors,
+    # so it should have been kicked off before the above computation on the compressed tensors to hide more communication costs.
+    # However, this somehow requires a separate future chain at this time.
+    allreduce_contiguous_uncompressed_tensors_fut = dist.all_reduce(
+        uncompressed_tensors_memory, group=group_to_use, async_op=True
+    ).get_future()
+
+    def unpack_uncompressed_tensors_and_allgather_indices(fut):
+        uncompressed_tensors_memory = fut.value()[0].div_(world_size)
+        idx = 0
+        for tensor in uncompressed_tensors:
+            tensor.copy_(
+                uncompressed_tensors_memory[idx : idx + tensor.numel()].view_as(tensor)
+            )
+            idx += tensor.numel()
+
+        return [
+            dist.all_gather(
+                output_indices, all_indices, group=group_to_use, async_op=True
+            )
+            .get_future()
+            .wait()[0]
+        ]
+
+    def unpack_indices_and_all_gather_values(fut):
+        global output_indices
+        output_indices = fut.value()[0]
+
+        return [
+            dist.all_gather(
+            output_values, all_values, group=group_to_use, async_op=True
+            )
+            .get_future()
+            .wait()[0]
+        ]
 
     def decompress(fut):
-        agg_tensor = fut.value()[0]
-        indices, values = agg_tensor[0], agg_tensor[1]
-        output_tensor = torch.zeros_like(input_tensor, device=input_tensor.device, dtype=input_tensor.dtype)
-        output_tensor[indices] = values
+        output_values = fut.value()[0]
 
-        return [output_tensor]
-    return fut.then(decompress)
+        for tensor in tensors_to_compress:
+            torch.zeros(tensor.shape, out=tensor)
 
+        for (indices, values) in zip(output_indices, output_values):
+            input_tensor[indices].add_(values)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
 
+        input_tensor.div_(world_size)
 
+        state.maybe_increase_iter(bucket)
 
+        return [input_tensor]
 
-
-
-
-
-
+    return (
+        allreduce_contiguous_uncompressed_tensors_fut.then(
+            unpack_indices_and_all_gather_values
+        )
+        .then(unpack_indices_and_all_gather_values)
+        .then(decompress)
+    )
 
 
 
