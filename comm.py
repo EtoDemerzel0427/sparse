@@ -51,6 +51,8 @@ def compress_hook(state: MemoryState, bucket):
     # divide tensors into two groups,
     # one will be compressed before doing all_gather, another will directly do allreduce as normal without compression
     tensors_to_compress, uncompressed_tensors = [], []
+    compress_idx = []
+    start_idx = 0
     compress_size, uncompress_size = 0, 0
     for tensor in tensors:
         # don't compress tensors with too few parameters
@@ -60,6 +62,8 @@ def compress_hook(state: MemoryState, bucket):
         else:
             tensors_to_compress.append(tensor)
             compress_size += tensor.numel()
+            compress_idx.append(start_idx)
+        start_idx += tensor.numel()
 
     bucket_id = bucket.get_index()
     if bucket_id not in state.momentum_dict:
@@ -101,7 +105,7 @@ def compress_hook(state: MemoryState, bucket):
     # handle the tensors that should be compressed
     all_indices, all_values = [], []
     start_idx = 0
-    for tensor in tensors_to_compress:
+    for tensor, idx  in zip(tensors_to_compress, compress_idx):
         # accumulate local gradients with current grad tensor adding in
         mmt = state.momentum_dict[bucket_id][start_idx: start_idx + tensor.numel()]
         vec = state.volocities_dict[bucket_id][start_idx: start_idx + tensor.numel()]
@@ -111,7 +115,7 @@ def compress_hook(state: MemoryState, bucket):
         else:
             mmt.mul_(state.momentum).add_(tensor.view(-1))
             vec.add_(mmt)
-
+        
         # select top k
         importance = tensor.abs().view(-1)
         threshold = torch.min(
@@ -121,11 +125,12 @@ def compress_hook(state: MemoryState, bucket):
         values = mmt.clone()[indices]
 
         # map indices to global
-        indices.add_(start_idx)
+        dict_indices = indices.add(start_idx)
+        indices.add_(idx)
 
         # clear those entries in memory states
-        state.momentum_dict[bucket_id].index_fill_(0, indices, 0)
-        state.volocities_dict[bucket_id].index_fill_(0, indices, 0)
+        state.momentum_dict[bucket_id].index_fill_(0, dict_indices, 0)
+        state.volocities_dict[bucket_id].index_fill_(0, dict_indices, 0)
 
         all_indices.append(indices)
         all_values.append(values)
@@ -162,12 +167,11 @@ def compress_hook(state: MemoryState, bucket):
         ]
 
     def unpack_indices_and_all_gather_values(fut):
-        global output_indices
         output_indices = fut.value()[0]
 
         return [
             dist.all_gather(
-            output_values, all_values, group=group_to_use, async_op=True
+                output_values, all_values, group=group_to_use, async_op=True
             )
             .get_future()
             .wait()[0]
@@ -175,12 +179,13 @@ def compress_hook(state: MemoryState, bucket):
 
     def decompress(fut):
         output_values = fut.value()[0]
-
         for tensor in tensors_to_compress:
             torch.zeros(tensor.shape, out=tensor)
 
         for (indices, values) in zip(output_indices, output_values):
-            input_tensor[indices].add_(values)
+            # print("[BEFORE] ", input_tensor[indices], indices, values)
+            input_tensor[indices] += values
+            # print("[AFTER] ", input_tensor[indices])
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
 
