@@ -136,7 +136,10 @@ def main():
     else:
         model = model.to(device)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.rank], output_device=args.rank)
-
+    
+    for name, parameter in model.named_parameters():
+        if len(parameter.shape) > 1:
+            print(name, parameter.shape)
 
     cudnn.benchmark = True
 

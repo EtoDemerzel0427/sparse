@@ -63,9 +63,33 @@ def compress_hook(state: MemoryState, bucket):
 
     bucket_id = bucket.get_index()
     if bucket_id not in state.momentum_dict:
+        # print("[PRE] iter: ", state.iter, " bucket id: ", bucket_id, "compress size: ", compress_size)
+        
+        # print("[PRE] bucket id: ", bucket_id, "  tensors_to_compress:")
+        # total_size = 0
+        # for tensor in tensors_to_compress:
+        #    total_size += tensor.numel()
+        #    print(tensor.shape, total_size)
+        # print("[PRE] bucket id: ", bucket_id, " uncompressed_tensors:")
+        # total_size = 0
+        # for tensor in uncompressed_tensors:
+        #    total_size += tensor.numel()
+        #    print(tensor.shape, total_size)
         state.momentum_dict[bucket_id] = torch.zeros(compress_size, device=device, dtype=dtype)
-        state.volocities_dict[bucket_id] = torch.zeros(uncompress_size, device=device, dtype=dtype)
-
+        state.volocities_dict[bucket_id] = torch.zeros(compress_size, device=device, dtype=dtype)
+    
+    # if state.iter == 4:
+    #    print("[POST] iter: ", state.iter, " bucket id: ", bucket_id, " tensors_to_compress:")
+    #    total_size = 0
+    #    for tensor in tensors_to_compress:
+    #        total_size += tensor.numel()
+    #        print(tensor.shape, total_size)
+    #    print("[POST] bucket id: ", bucket_id, " uncompressed_tensors:")
+    #    total_size = 0
+    #    for tensor in uncompressed_tensors:
+    #        total_size += tensor.numel()
+    #        print(tensor.shape, total_size)
+    # print("[POST] iter: ", state.iter, " bucket id: ", bucket_id, "compress size: ", compress_size)
     # handle uncompressed_tensors
     # Allocate contiguous memory for these tensors to allreduce efficiently.
     uncompressed_tensors_memory = (
@@ -110,8 +134,8 @@ def compress_hook(state: MemoryState, bucket):
 
     all_indices = torch.cat(all_indices)
     all_values = torch.cat(all_values)
-    output_indices = [torch.zeros_like(all_indices, device=device, dtype=dtype) for _ in world_size]
-    output_values = [torch.zeros_like(all_values, device=device, dtype=dtype) for _ in world_size]
+    output_indices = [torch.zeros_like(all_indices, device=device, dtype=all_indices.dtype) for _ in range(world_size)]
+    output_values = [torch.zeros_like(all_values, device=device, dtype=all_values.dtype) for _ in range(world_size)]
 
     # This allreduce is only applied to uncompressed tensors,
     # so it should have been kicked off before the above computation on the compressed tensors to hide more communication costs.
@@ -168,7 +192,7 @@ def compress_hook(state: MemoryState, bucket):
 
     return (
         allreduce_contiguous_uncompressed_tensors_fut.then(
-            unpack_indices_and_all_gather_values
+            unpack_uncompressed_tensors_and_allgather_indices
         )
         .then(unpack_indices_and_all_gather_values)
         .then(decompress)
